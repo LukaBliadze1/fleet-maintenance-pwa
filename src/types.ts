@@ -2,6 +2,14 @@ export type MachineStatus = 'active' | 'inactive' | 'archived';
 
 export type MeterUnit = 'hours' | 'kilometers' | 'miles' | 'unknown';
 
+export interface MachinePart {
+  component: string;
+  specification: string;
+  sourceCell?: string;
+  author?: string;
+  commentedAt?: string;
+}
+
 export interface Machine {
   id: string;
   displayName: string;
@@ -19,6 +27,7 @@ export interface Machine {
   meterValue?: number;
   meterRecordedAt?: string;
   notes?: string;
+  parts?: MachinePart[];
   sourceAttributes: Record<string, string>;
   createdAt: string;
   updatedAt: string;
@@ -46,6 +55,7 @@ export interface MaintenanceRecord {
   workPerformed: string;
   partsUsed?: string;
   notes?: string;
+  sourceAttributes?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
   localVersion: number;

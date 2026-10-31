@@ -2,24 +2,24 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } 
 import { useLiveQuery } from 'dexie-react-hooks';
 import {
   Archive,
-  ArrowDownRight,
   ArrowLeft,
   ArrowUpRight,
   Bell,
   Check,
+  CheckCircle2,
   ChevronRight,
-  CircleHelp,
   Clock3,
   CloudOff,
+  FileSpreadsheet,
+  Gauge,
   HardHat,
+  Layers,
   LayoutDashboard,
   Languages,
-  MapPin,
   Menu,
   Plus,
   Search,
   Settings,
-  ShieldCheck,
   Truck,
   Wrench,
   X
@@ -27,16 +27,17 @@ import {
 import { db } from './data/localDb';
 import { archiveMachine, saveMachine, searchMachines } from './data/machines';
 import { saveMaintenanceRecord } from './data/maintenance';
+import { nextService, type NextService } from './data/service';
 import { i18n, restoreLocalePreference, saveLocalePreference, type AppLocale } from './i18n';
 import type {
   Machine,
   MachineInput,
   MaintenanceRecordInput,
   MeterUnit,
-  WorkbookIssueDecision,
-  WorkbookIssueDecisionAction
+  WorkbookIssueDecision
 } from './types';
-import type { WorkbookDryRun, WorkbookIssue } from './data/workbookImport';
+import type { WorkbookDryRun } from './data/workbookImport';
+import type { SkippedRow, WorkbookCommitResult, WorkbookImportPlan } from './data/workbookCommit';
 import { useTranslation } from 'react-i18next';
 
 type Page = 'dashboard' | 'fleet' | 'settings';
@@ -63,17 +64,13 @@ function App() {
   const [workbookPreview, setWorkbookPreview] = useState<WorkbookDryRun>();
   const [isAnalyzingWorkbook, setIsAnalyzingWorkbook] = useState(false);
   const [workbookReviewHash, setWorkbookReviewHash] = useState<string>();
+  const [workbookPlan, setWorkbookPlan] = useState<WorkbookImportPlan>();
   const [menuOpen, setMenuOpen] = useState(false);
   const [networkAvailable, setNetworkAvailable] = useState(navigator.onLine);
   const [errorMessage, setErrorMessage] = useState('');
 
   const allMachines = useLiveQuery(() => searchMachines(''), [], []);
   const machines = useLiveQuery(() => searchMachines(query), [query], []);
-  const pendingCount = useLiveQuery(
-    () => db.outbox.where('status').equals('pending').count(),
-    [],
-    0
-  );
   const selectedMachine = useLiveQuery(
     () => (selectedMachineId ? db.machines.get(selectedMachineId) : undefined),
     [selectedMachineId]
@@ -118,6 +115,28 @@ function App() {
       active = false;
     };
   }, [t]);
+
+  useEffect(() => {
+    if (!workbookPreview) {
+      setWorkbookPlan(undefined);
+      return;
+    }
+
+    let active = true;
+    void import('./data/workbookCommit')
+      .then(({ planWorkbookImport }) => planWorkbookImport(workbookPreview, workbookDecisions))
+      .then((plan) => {
+        if (active) setWorkbookPlan(plan);
+      })
+      .catch((error: unknown) => {
+        console.error('The workbook import could not be prepared.', error);
+        if (active) setErrorMessage(t('import.planFailed'));
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [workbookPreview, workbookDecisions, t]);
 
   useEffect(() => {
     const locale = i18n.resolvedLanguage === 'ka' ? 'ka' : 'en';
@@ -191,24 +210,34 @@ function App() {
     }
   }
 
-  async function handleWorkbookDecision(
-    issue: WorkbookIssue,
-    action: WorkbookIssueDecisionAction,
-    interpretedValue?: string
-  ): Promise<void> {
-    if (!workbookPreview || !issue.id) {
-      throw new Error('The review item is missing its source identity.');
+  async function handleAddWorkbookDate(issueId: string, date: string): Promise<void> {
+    if (!workbookPreview) {
+      throw new Error('No workbook is being imported.');
     }
 
     const decision: WorkbookIssueDecision = {
-      id: `${workbookPreview.sourceHash}:${issue.id}`,
+      id: `${workbookPreview.sourceHash}:${issueId}`,
       workbookHash: workbookPreview.sourceHash,
-      issueId: issue.id,
-      action,
-      interpretedValue,
+      issueId,
+      action: 'interpreted-date',
+      interpretedValue: date,
       updatedAt: new Date().toISOString()
     };
     await db.workbookIssueDecisions.put(decision);
+  }
+
+  function closeWorkbookImport() {
+    setWorkbookPreview(undefined);
+    setWorkbookReviewHash(undefined);
+  }
+
+  async function handleWorkbookCommit(): Promise<WorkbookCommitResult> {
+    if (!workbookPlan) {
+      throw new Error('The workbook import is not ready.');
+    }
+
+    const { commitWorkbookImport } = await import('./data/workbookCommit');
+    return commitWorkbookImport(workbookPlan);
   }
 
   async function handleArchiveMachine(machine: Machine) {
@@ -332,10 +361,6 @@ function App() {
               <span className="connection-dot" />
               {networkAvailable ? t('header.networkAvailable') : t('header.offline')}
             </div>
-            <button className="icon-button notification-button" type="button" aria-label={t('header.notifications')}>
-              <Bell size={18} />
-              <span className="notification-dot" />
-            </button>
             <div className="topbar-avatar" aria-label={t('navigation.fleetManager')}>
               {t('navigation.fleetManagerInitials')}
             </div>
@@ -371,20 +396,23 @@ function App() {
             <Dashboard
               machines={allMachines}
               activeMachines={activeMachines.length}
-              pendingCount={pendingCount}
               onOpenFleet={openFleet}
+              onOpenMachine={(machine) => setSelectedMachineId(machine.id)}
               onCreateMachine={startCreateMachine}
             />
           ) : page === 'fleet' ? (
             <FleetPage
+              allMachines={allMachines}
               machines={machines}
               query={query}
               onQueryChange={setQuery}
               onCreateMachine={startCreateMachine}
               onOpenMachine={(machine) => setSelectedMachineId(machine.id)}
               workbookPreview={workbookPreview}
-              workbookDecisions={workbookDecisions}
-              onWorkbookDecision={handleWorkbookDecision}
+              workbookPlan={workbookPlan}
+              onAddWorkbookDate={handleAddWorkbookDate}
+              onWorkbookCommit={handleWorkbookCommit}
+              onCloseWorkbookImport={closeWorkbookImport}
               isAnalyzingWorkbook={isAnalyzingWorkbook}
               onWorkbookSelected={handleWorkbookSelected}
             />
@@ -414,9 +442,13 @@ function App() {
             <Plus size={20} />
             <span>{t('dashboard.addMachine')}</span>
           </button>
-          <button type="button" aria-label={t('header.notifications')}>
-            <Bell size={19} />
-            <span>{t('header.notifications')}</span>
+          <button
+            className={page === 'settings' ? 'mobile-nav-active' : ''}
+            type="button"
+            onClick={openSettings}
+          >
+            <Settings size={19} />
+            <span>{t('navigation.settings')}</span>
           </button>
         </nav>
       </main>
@@ -438,18 +470,43 @@ function App() {
 function Dashboard({
   machines,
   activeMachines,
-  pendingCount,
   onOpenFleet,
+  onOpenMachine,
   onCreateMachine
 }: {
   machines: Machine[];
   activeMachines: number;
-  pendingCount: number;
   onOpenFleet: () => void;
+  onOpenMachine: (machine: Machine) => void;
   onCreateMachine: () => void;
 }) {
   const { t, i18n } = useTranslation();
+  const records = useLiveQuery(
+    () => db.maintenanceRecords.orderBy('performedAt').reverse().toArray(),
+    [],
+    []
+  );
+  const machinesById = new Map(machines.map((machine) => [machine.id, machine]));
+  const latestReadings = new Map<string, number>();
+  for (const record of records) {
+    if (record.meterReading !== undefined && !latestReadings.has(record.machineId)) {
+      latestReadings.set(record.machineId, record.meterReading);
+    }
+  }
+  const serviceRank = (service: NextService) => service.remaining ?? Number.MAX_SAFE_INTEGER;
+  const upcomingService = machines
+    .flatMap((machine) => {
+      const service = nextService(machine, latestReadings.get(machine.id));
+      return service ? [{ machine, service }] : [];
+    })
+    .sort((left, right) => serviceRank(left.service) - serviceRank(right.service))
+    .slice(0, 5);
+  const categoryCounts = [...machines.reduce((counts, machine) => {
+    const category = machine.category ?? t('dashboard.uncategorized');
+    return counts.set(category, (counts.get(category) ?? 0) + 1);
+  }, new Map<string, number>())].sort((left, right) => right[1] - left[1]);
   const needsAttention = machines.filter((machine) => machine.status === 'inactive').length;
+  const formatNumber = (value: number) => new Intl.NumberFormat(i18n.resolvedLanguage).format(value);
   const metrics = [
     { label: t('dashboard.totalMachines'), value: machines.length, icon: Truck, tone: 'slate' },
     { label: t('dashboard.activeFleet'), value: activeMachines, icon: Check, tone: 'green' },
@@ -461,7 +518,7 @@ function Dashboard({
       <section className="welcome-row">
         <div>
           <div className="eyebrow">{formatDashboardDate(i18n.resolvedLanguage)}</div>
-          <h1>{t('greeting.afternoon')}</h1>
+          <h1>{t(greetingKey())}</h1>
           <p className="page-lede">{t('dashboard.lede')}</p>
         </div>
         <button className="button button-primary" type="button" onClick={onCreateMachine}>
@@ -472,18 +529,18 @@ function Dashboard({
 
       <section className="metric-grid" aria-label={t('dashboard.fleetSummary')}>
         {metrics.map(({ label, value, icon: Icon, tone }) => (
-          <article className="metric-card" key={label}>
+          <button className="metric-card" type="button" key={label} onClick={onOpenFleet}>
             <div className={`metric-icon metric-icon-${tone}`}>
               <Icon size={19} />
             </div>
             <div className="metric-copy">
               <span>{label}</span>
-              <strong>{new Intl.NumberFormat(i18n.resolvedLanguage).format(value)}</strong>
+              <strong>{formatNumber(value)}</strong>
             </div>
             <div className="metric-trend">
               <ArrowUpRight size={15} />
             </div>
-          </article>
+          </button>
         ))}
       </section>
 
@@ -513,17 +570,22 @@ function Dashboard({
           ) : (
             <div className="overview-list">
               {machines.slice(0, 5).map((machine) => (
-                <div className="overview-row" key={machine.id}>
+                <button
+                  className="overview-row overview-row-button"
+                  type="button"
+                  key={machine.id}
+                  onClick={() => onOpenMachine(machine)}
+                >
                   <div className="machine-thumbnail">
                     <Truck size={19} />
                   </div>
                   <div className="overview-machine">
                     <strong>{machine.displayName}</strong>
-                    <span>{[machine.manufacturer, machine.model].filter(Boolean).join(' · ') || t('dashboard.detailsNotAdded')}</span>
+                    <span>{machineSubtitle(machine)}</span>
                   </div>
                   <StatusBadge status={machine.status} />
                   <ChevronRight className="overview-chevron" size={16} />
-                </div>
+                </button>
               ))}
             </div>
           )}
@@ -532,42 +594,41 @@ function Dashboard({
         <div className="panel attention-panel">
           <div className="panel-heading">
             <div>
-              <h2>{t('dashboard.maintenanceAttention')}</h2>
-              <p>{t('dashboard.scheduleNotConfigured')}</p>
+              <h2>{t('dashboard.upcomingService')}</h2>
+              <p>{t('dashboard.upcomingServiceHint')}</p>
             </div>
             <div className="attention-symbol">
-              <Wrench size={18} />
+              <Gauge size={18} />
             </div>
           </div>
-          <div className="attention-empty">
-            <div className="attention-line">
-              <span className="attention-line-icon">
-                <Clock3 size={16} />
-              </span>
-              <div>
-                <strong>{t('dashboard.noSchedule')}</strong>
-                <span>{t('dashboard.scheduleReview')}</span>
-              </div>
-            </div>
-            <div className="attention-line">
-              <span className="attention-line-icon attention-line-muted">
-                <ShieldCheck size={16} />
-              </span>
-              <div>
-                <strong>{t('dashboard.localSaved')}</strong>
-                <span>
-                  {pendingCount === 0
-                    ? t('dashboard.noPendingChanges')
-                    : t(pendingCount === 1 ? 'dashboard.pendingOne' : 'dashboard.pendingMany', {
-                        count: new Intl.NumberFormat(i18n.resolvedLanguage).format(pendingCount)
+          {upcomingService.length === 0 ? (
+            <EmptyState
+              icon={<Clock3 size={20} />}
+              title={t('dashboard.noUpcomingService')}
+              description={t('dashboard.noUpcomingServiceHint')}
+            />
+          ) : (
+            <div className="overview-list">
+              {upcomingService.map(({ machine, service }) => (
+                <button
+                  className="overview-row overview-row-button"
+                  type="button"
+                  key={machine.id}
+                  onClick={() => onOpenMachine(machine)}
+                >
+                  <div className="overview-machine">
+                    <strong>{machine.displayName}</strong>
+                    <span>
+                      {t('dashboard.serviceAt', {
+                        value: formatMeter(service.target, service.unit, i18n.resolvedLanguage, t)
                       })}
-                </span>
-              </div>
+                    </span>
+                  </div>
+                  <ServiceRemaining service={service} />
+                </button>
+              ))}
             </div>
-          </div>
-          <div className="panel-footnote">
-            <CircleHelp size={15} /> {t('dashboard.noIntervals')}
-          </div>
+          )}
         </div>
       </section>
 
@@ -578,76 +639,132 @@ function Dashboard({
               <h2>{t('dashboard.recentMaintenance')}</h2>
               <p>{t('dashboard.latestWork')}</p>
             </div>
-            <button className="text-button muted-button" type="button" disabled>
-              {t('dashboard.allRecords')} <ChevronRight size={15} />
-            </button>
           </div>
-          <EmptyState
-            icon={<Wrench size={20} />}
-            title={t('dashboard.noHistory')}
-            description={t('dashboard.importHistory')}
-          />
+          {records.length === 0 ? (
+            <EmptyState
+              icon={<Wrench size={20} />}
+              title={t('dashboard.noHistory')}
+              description={t('dashboard.importHistory')}
+            />
+          ) : (
+            <div className="overview-list">
+              {records.slice(0, 5).map((record) => {
+                const machine = machinesById.get(record.machineId);
+                return (
+                  <button
+                    className="overview-row overview-row-button"
+                    type="button"
+                    key={record.id}
+                    disabled={!machine}
+                    onClick={() => machine && onOpenMachine(machine)}
+                  >
+                    <div className="machine-thumbnail">
+                      <Wrench size={17} />
+                    </div>
+                    <div className="overview-machine">
+                      <strong>{record.workPerformed}</strong>
+                      <span>
+                        {[machine?.displayName, formatRecordDate(record.performedAt, i18n.resolvedLanguage)]
+                          .filter(Boolean)
+                          .join(' · ')}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
         <div className="panel update-panel">
           <div className="panel-heading">
             <div>
-              <h2>{t('dashboard.operatingHours')}</h2>
-              <p>{t('dashboard.latestMeters')}</p>
+              <h2>{t('dashboard.byCategory')}</h2>
+              <p>{t('dashboard.byCategoryHint')}</p>
             </div>
             <div className="update-icon">
-              <ArrowDownRight size={17} />
+              <Layers size={17} />
             </div>
           </div>
-          <div className="meter-empty">
-            <span>—</span>
-            <p>{t('dashboard.noVerifiedMeters')}</p>
-          </div>
-          <div className="panel-footnote">
-            <MapPin size={14} /> {t('dashboard.meterUnitNote')}
-          </div>
+          {categoryCounts.length === 0 ? (
+            <EmptyState
+              icon={<Layers size={20} />}
+              title={t('fleet.noneOnDevice')}
+              description={t('dashboard.addOrImport')}
+            />
+          ) : (
+            <div className="category-list">
+              {categoryCounts.map(([category, count]) => (
+                <div className="category-row" key={category}>
+                  <div className="category-row-label">
+                    <span>{category}</span>
+                    <strong>{formatNumber(count)}</strong>
+                  </div>
+                  <div className="category-bar" aria-hidden="true">
+                    <span style={{ width: `${(count / machines.length) * 100}%` }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </section>
-
-      <footer className="page-footer">
-        <span>{t('brand.title')} · {t('navigation.localWorkspace')}</span>
-        <span>
-          {t(pendingCount === 1 ? 'dashboard.pendingLocalOne' : 'dashboard.pendingLocalMany', {
-            count: new Intl.NumberFormat(i18n.resolvedLanguage).format(pendingCount)
-          })}
-        </span>
-      </footer>
     </>
   );
 }
 
+function ServiceRemaining({ service }: { service: NextService }) {
+  const { t, i18n } = useTranslation();
+  if (service.remaining === undefined) return null;
+
+  const value = formatMeter(Math.abs(service.remaining), service.unit, i18n.resolvedLanguage, t);
+  return (
+    <span className={`service-remaining ${service.remaining < 0 ? 'service-overdue' : ''}`}>
+      {t(service.remaining < 0 ? 'dashboard.serviceOverdue' : 'dashboard.serviceRemaining', { value })}
+    </span>
+  );
+}
+
 function FleetPage({
+  allMachines,
   machines,
   query,
   onQueryChange,
   onCreateMachine,
   onOpenMachine,
   workbookPreview,
-  workbookDecisions,
-  onWorkbookDecision,
+  workbookPlan,
+  onAddWorkbookDate,
+  onWorkbookCommit,
+  onCloseWorkbookImport,
   isAnalyzingWorkbook,
   onWorkbookSelected
 }: {
+  allMachines: Machine[];
   machines: Machine[];
   query: string;
   onQueryChange: (value: string) => void;
   onCreateMachine: () => void;
   onOpenMachine: (machine: Machine) => void;
   workbookPreview?: WorkbookDryRun;
-  workbookDecisions: WorkbookIssueDecision[];
-  onWorkbookDecision: (
-    issue: WorkbookIssue,
-    action: WorkbookIssueDecisionAction,
-    interpretedValue?: string
-  ) => Promise<void>;
+  workbookPlan?: WorkbookImportPlan;
+  onAddWorkbookDate: (issueId: string, date: string) => Promise<void>;
+  onWorkbookCommit: () => Promise<WorkbookCommitResult>;
+  onCloseWorkbookImport: () => void;
   isAnalyzingWorkbook: boolean;
   onWorkbookSelected: (file: File) => Promise<void>;
 }) {
   const { t, i18n } = useTranslation();
+  const [importOpen, setImportOpen] = useState(false);
+  const [category, setCategory] = useState<string>();
+  const showImport = importOpen || isAnalyzingWorkbook || Boolean(workbookPreview) || allMachines.length === 0;
+  const categoryCounts = [...allMachines.reduce((counts, machine) => (
+    machine.category ? counts.set(machine.category, (counts.get(machine.category) ?? 0) + 1) : counts
+  ), new Map<string, number>())].sort(([left], [right]) => left.localeCompare(right));
+  const visibleMachines = category
+    ? machines.filter((machine) => machine.category === category)
+    : machines;
+  const formatNumber = (value: number) => new Intl.NumberFormat(i18n.resolvedLanguage).format(value);
+  const isFiltered = Boolean(query || category);
 
   return (
     <>
@@ -657,19 +774,34 @@ function FleetPage({
           <h1>{t('fleet.title')}</h1>
           <p className="page-lede">{t('fleet.searchDescription')}</p>
         </div>
-        <button className="button button-primary" type="button" onClick={onCreateMachine}>
-          <Plus size={17} />
-          {t('dashboard.addMachine')}
-        </button>
+        <div className="welcome-actions">
+          {!showImport && (
+            <button className="button button-secondary" type="button" onClick={() => setImportOpen(true)}>
+              <FileSpreadsheet size={17} />
+              {t('fleet.importExcel')}
+            </button>
+          )}
+          <button className="button button-primary" type="button" onClick={onCreateMachine}>
+            <Plus size={17} />
+            {t('dashboard.addMachine')}
+          </button>
+        </div>
       </section>
 
-      <WorkbookImportPanel
-        preview={workbookPreview}
-        decisions={workbookDecisions}
-        onDecision={onWorkbookDecision}
-        isAnalyzing={isAnalyzingWorkbook}
-        onFileSelected={onWorkbookSelected}
-      />
+      {showImport && (
+        <WorkbookImportPanel
+          preview={workbookPreview}
+          plan={workbookPlan}
+          isAnalyzing={isAnalyzingWorkbook}
+          onFileSelected={onWorkbookSelected}
+          onAddDate={onAddWorkbookDate}
+          onCommit={onWorkbookCommit}
+          onClose={() => {
+            setImportOpen(false);
+            onCloseWorkbookImport();
+          }}
+        />
+      )}
 
       <section className="fleet-toolbar">
         <label className="search-field">
@@ -693,24 +825,44 @@ function FleetPage({
           )}
         </label>
         <span className="result-count">
-          {t(machines.length === 1 ? 'fleet.machineOne' : 'fleet.machineMany', {
-            count: new Intl.NumberFormat(i18n.resolvedLanguage).format(machines.length)
+          {t(visibleMachines.length === 1 ? 'fleet.machineOne' : 'fleet.machineMany', {
+            count: formatNumber(visibleMachines.length)
           })}
         </span>
       </section>
 
-      {machines.length === 0 ? (
+      {categoryCounts.length > 1 && (
+        <div className="category-chips" role="group" aria-label={t('fleet.categoryFilter')}>
+          <button
+            className={`chip ${category === undefined ? 'chip-active' : ''}`}
+            type="button"
+            aria-pressed={category === undefined}
+            onClick={() => setCategory(undefined)}
+          >
+            {t('fleet.allCategories')} <span>{formatNumber(allMachines.length)}</span>
+          </button>
+          {categoryCounts.map(([name, count]) => (
+            <button
+              className={`chip ${category === name ? 'chip-active' : ''}`}
+              type="button"
+              key={name}
+              aria-pressed={category === name}
+              onClick={() => setCategory(category === name ? undefined : name)}
+            >
+              {name} <span>{formatNumber(count)}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {visibleMachines.length === 0 ? (
         <div className="panel fleet-empty-panel">
           <EmptyState
-            icon={query ? <Search size={22} /> : <Truck size={22} />}
-            title={t(query ? 'fleet.noMatches' : 'fleet.noneOnDevice')}
-            description={
-              query
-                ? t('fleet.tryAnotherSearch')
-                : t('fleet.addOrImport')
-            }
+            icon={isFiltered ? <Search size={22} /> : <Truck size={22} />}
+            title={t(isFiltered ? 'fleet.noMatches' : 'fleet.noneOnDevice')}
+            description={isFiltered ? t('fleet.tryAnotherSearch') : t('fleet.addOrImport')}
             action={
-              query ? undefined : (
+              isFiltered ? undefined : (
                 <button className="button button-secondary" type="button" onClick={onCreateMachine}>
                   <Plus size={16} /> {t('dashboard.addMachine')}
                 </button>
@@ -720,79 +872,79 @@ function FleetPage({
         </div>
       ) : (
         <section className="machine-grid" aria-label={t('fleet.machineList')}>
-          {machines.map((machine) => (
-            <button
-              className="machine-card"
-              type="button"
-              key={machine.id}
-              onClick={() => onOpenMachine(machine)}
-            >
-              <div className="machine-card-top">
-                <div className="machine-thumbnail machine-thumbnail-large">
-                  <Truck size={22} />
+          {visibleMachines.map((machine) => {
+            const identifier = machine.registrationNumber || machine.serialNumber;
+            const meter = machine.meterValue === undefined
+              ? undefined
+              : formatMeter(machine.meterValue, machine.meterUnit, i18n.resolvedLanguage, t);
+            return (
+              <button
+                className="machine-card"
+                type="button"
+                key={machine.id}
+                onClick={() => onOpenMachine(machine)}
+              >
+                <div className="machine-card-top">
+                  <div className="machine-thumbnail machine-thumbnail-large">
+                    <Truck size={22} />
+                  </div>
+                  <StatusBadge status={machine.status} />
                 </div>
-                <StatusBadge status={machine.status} />
-              </div>
-              <div className="machine-card-copy">
-                <strong>{machine.displayName}</strong>
-                <span>{[machine.manufacturer, machine.model].filter(Boolean).join(' · ') || t('profile.manufacturerModelMissing')}</span>
-              </div>
-              <div className="machine-card-meta">
-                <span>{machine.registrationNumber || machine.serialNumber || t('fleet.noRegistration')}</span>
-                <span>
-                  {machine.meterValue !== undefined
-                    ? `${new Intl.NumberFormat(i18n.resolvedLanguage).format(machine.meterValue)} ${meterUnitLabel(machine.meterUnit, t)}`
-                    : t('fleet.meterNotRecorded')}
-                </span>
-              </div>
-              <div className="machine-card-footer">
-                <span>{machine.location || t('fleet.locationNotSet')}</span>
-                <ChevronRight size={17} />
-              </div>
-            </button>
-          ))}
+                <div className="machine-card-copy">
+                  <strong>{machine.displayName}</strong>
+                  <span>{[machine.manufacturer, machine.model].filter(Boolean).join(' · ')}</span>
+                </div>
+                {(identifier || meter) && (
+                  <div className="machine-card-meta">
+                    <span>{identifier}</span>
+                    {meter && <span className="machine-card-meter"><Gauge size={13} /> {meter}</span>}
+                  </div>
+                )}
+                <div className="machine-card-footer">
+                  <span>{[machine.category, machine.location].filter(Boolean).join(' · ')}</span>
+                  <ChevronRight size={17} />
+                </div>
+              </button>
+            );
+          })}
         </section>
       )}
-
-      <footer className="page-footer">
-        <span>{t('fleet.localSearch')}</span>
-        <span>{t('fleet.notSynced')}</span>
-      </footer>
     </>
   );
 }
 
 function WorkbookImportPanel({
   preview,
-  decisions,
-  onDecision,
+  plan,
   isAnalyzing,
-  onFileSelected
+  onFileSelected,
+  onAddDate,
+  onCommit,
+  onClose
 }: {
   preview?: WorkbookDryRun;
-  decisions: WorkbookIssueDecision[];
-  onDecision: (
-    issue: WorkbookIssue,
-    action: WorkbookIssueDecisionAction,
-    interpretedValue?: string
-  ) => Promise<void>;
+  plan?: WorkbookImportPlan;
   isAnalyzing: boolean;
   onFileSelected: (file: File) => Promise<void>;
+  onAddDate: (issueId: string, date: string) => Promise<void>;
+  onCommit: () => Promise<WorkbookCommitResult>;
+  onClose: () => void;
 }) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const fileInput = useRef<HTMLInputElement>(null);
-
-  function sourceValue(row: WorkbookDryRun['maintenanceRows'][number], label: string): string {
-    return row.cells.find((cell) => cell.header.toLocaleLowerCase() === label.toLocaleLowerCase())
-      ?.source.displayText ?? '';
-  }
+  const readyPlan = plan && plan.sourceHash === preview?.sourceHash ? plan : undefined;
 
   return (
     <section className="panel workbook-import-panel" aria-labelledby="workbook-import-title">
       <div className="panel-heading">
-        <div>
-          <h2 id="workbook-import-title">{t('import.title')}</h2>
-          <p>{t('import.description')}</p>
+        <div className="import-heading">
+          <div className="import-heading-icon">
+            <FileSpreadsheet size={19} />
+          </div>
+          <div>
+            <h2 id="workbook-import-title">{t('import.title')}</h2>
+            <p>{preview ? preview.fileName : t('import.description')}</p>
+          </div>
         </div>
         <div className="import-file-actions">
           <input
@@ -808,169 +960,153 @@ function WorkbookImportPanel({
             }}
           />
           <button
-            className="button button-secondary"
+            className={`button ${preview ? 'button-secondary' : 'button-primary'}`}
             type="button"
             disabled={isAnalyzing}
             onClick={() => fileInput.current?.click()}
           >
-            {isAnalyzing ? t('import.analyzing') : t('import.chooseFile')}
+            {isAnalyzing ? t('import.analyzing') : t(preview ? 'import.chooseAnother' : 'import.chooseFile')}
+          </button>
+          <button className="icon-button" type="button" aria-label={t('import.close')} onClick={onClose}>
+            <X size={18} />
           </button>
         </div>
       </div>
 
-      <div className="import-safety-note">
-        <ShieldCheck size={16} />
-        <span>{t('import.dryRunOnly')}</span>
-      </div>
-
-      {!preview ? (
-        <p className="import-empty-note">{t('import.noWorkbook')}</p>
-      ) : (
-        <div className="import-report">
-          <div className="import-file-name">{preview.fileName}</div>
-          <div className="import-summary-grid">
-            <ImportMetric label={t('import.worksheets')} value={preview.sheets.length} locale={i18n.resolvedLanguage} />
-            <ImportMetric label={t('import.machineCandidates')} value={preview.machines.length} locale={i18n.resolvedLanguage} />
-            <ImportMetric label={t('import.maintenanceCandidates')} value={preview.maintenanceRows.length} locale={i18n.resolvedLanguage} />
-            <ImportMetric label={t('import.scheduleDrafts')} value={preview.schedules.length} locale={i18n.resolvedLanguage} />
-            <ImportMetric label={t('import.unresolvedIssues')} value={preview.issues.length} locale={i18n.resolvedLanguage} />
-          </div>
-          <div className="import-preservation-note">
-            {t('import.preservedSummary', {
-              cells: new Intl.NumberFormat(i18n.resolvedLanguage).format(preview.sourceCellCount),
-              formulas: new Intl.NumberFormat(i18n.resolvedLanguage).format(
-                preview.sheets.reduce((count, sheet) =>
-                  count + sheet.cells.filter((cell) => cell.formulaPresent).length, 0)
-              ),
-              comments: new Intl.NumberFormat(i18n.resolvedLanguage).format(preview.commentCount),
-              threadedComments: new Intl.NumberFormat(i18n.resolvedLanguage).format(
-                preview.threadedCommentCount
-              ),
-              formulaErrors: new Intl.NumberFormat(i18n.resolvedLanguage).format(preview.formulaErrorCount)
-            })}
-          </div>
-
-          <div className="import-report-section">
-            <h3>{t('import.sheetReview')}</h3>
-            <div className="import-sheet-list">
-              {preview.sheets.map((sheet) => (
-                <div className="import-sheet-row" key={sheet.name}>
-                  <strong>{sheet.name}</strong>
-                  <span>{t(`import.sheetType.${sheet.kind}`)}</span>
-                  <span>{t('import.sheetDimensions', {
-                    rows: new Intl.NumberFormat(i18n.resolvedLanguage).format(sheet.rowCount),
-                    columns: new Intl.NumberFormat(i18n.resolvedLanguage).format(sheet.columnCount)
-                  })}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {preview.maintenanceRows.length > 0 && (
-            <div className="import-report-section">
-              <h3>{t('import.historySample')}</h3>
-              <div className="import-table-scroll">
-                <table className="import-preview-table">
-                  <thead>
-                    <tr>
-                      <th>{t('import.sourceSheet')}</th>
-                      <th>{t('import.sourceRow')}</th>
-                      <th>{t('import.date')}</th>
-                      <th>{t('import.descriptionField')}</th>
-                      <th>{t('import.reading')}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {preview.maintenanceRows.slice(0, 5).map((row) => (
-                      <tr key={`${row.sheetName}-${row.rowNumber}`}>
-                        <td>{row.sheetName}</td>
-                        <td>{row.rowNumber}</td>
-                        <td>{sourceValue(row, 'Date')}</td>
-                        <td>{sourceValue(row, 'Description')}</td>
-                        <td>{sourceValue(row, 'Odometer')}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {preview.issues.length > 0 && (
-            <div className="import-report-section">
-              <h3>{t('import.unresolvedIssues')}</h3>
-              <p className="import-review-progress">
-                {t('import.reviewProgress', {
-                  reviewed: decisions.length,
-                  total: preview.issues.length
-                })}
-              </p>
-              <div className="import-issue-list">
-                {preview.issues.map((issue, index) => (
-                  <WorkbookIssueReview
-                    key={issue.id ?? `${issue.code}-${issue.sheetName}-${issue.rowNumber ?? index}`}
-                    issue={issue}
-                    preview={preview}
-                    decision={decisions.find((item) => item.issueId === issue.id)}
-                    onDecision={onDecision}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
+      {readyPlan && (
+        <WorkbookImportReport
+          key={readyPlan.sourceHash}
+          plan={readyPlan}
+          onAddDate={onAddDate}
+          onCommit={onCommit}
+          onDone={onClose}
+        />
       )}
     </section>
   );
 }
 
-function WorkbookIssueReview({
-  issue,
-  preview,
-  decision,
-  onDecision
+function WorkbookImportReport({
+  plan,
+  onAddDate,
+  onCommit,
+  onDone
 }: {
-  issue: WorkbookIssue;
-  preview: WorkbookDryRun;
-  decision?: WorkbookIssueDecision;
-  onDecision: (
-    issue: WorkbookIssue,
-    action: WorkbookIssueDecisionAction,
-    interpretedValue?: string
-  ) => Promise<void>;
+  plan: WorkbookImportPlan;
+  onAddDate: (issueId: string, date: string) => Promise<void>;
+  onCommit: () => Promise<WorkbookCommitResult>;
+  onDone: () => void;
+}) {
+  const { t, i18n } = useTranslation();
+  const [committing, setCommitting] = useState(false);
+  const [result, setResult] = useState<WorkbookCommitResult>();
+  const [commitError, setCommitError] = useState(false);
+  const formatCount = (value: number) => new Intl.NumberFormat(i18n.resolvedLanguage).format(value);
+  const undatedRows = plan.skippedRows.filter((row) => row.reason === 'date-unresolved' && row.issueId);
+  const leftOutCount = plan.skippedRows.length - undatedRows.length;
+  const partCount = plan.machines.reduce((count, { input }) => count + (input.parts?.length ?? 0), 0);
+
+  useEffect(() => setResult(undefined), [plan]);
+
+  async function handleCommit(): Promise<void> {
+    setCommitting(true);
+    setCommitError(false);
+    try {
+      setResult(await onCommit());
+    } catch (error) {
+      console.error('The workbook import could not be saved on this device.', error);
+      setCommitError(true);
+    } finally {
+      setCommitting(false);
+    }
+  }
+
+  if (result) {
+    return (
+      <div className="import-body">
+        <div className="import-success" role="status">
+          <CheckCircle2 size={22} />
+          <div>
+            <strong>{t('import.successTitle')}</strong>
+            <span>
+              {result.machinesCreated + result.machinesUpdated + result.recordsCreated > 0
+                ? t('import.successDetail', {
+                    machines: formatCount(result.machinesCreated),
+                    updated: formatCount(result.machinesUpdated),
+                    records: formatCount(result.recordsCreated)
+                  })
+                : t('import.nothingNew')}
+            </span>
+          </div>
+          <button className="button button-primary" type="button" onClick={onDone}>
+            {t('import.done')}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="import-body">
+      <div className="import-summary-grid">
+        <ImportMetric label={t('import.machines')} value={plan.machines.length} locale={i18n.resolvedLanguage} />
+        <ImportMetric label={t('import.records')} value={plan.records.length} locale={i18n.resolvedLanguage} />
+        <ImportMetric label={t('import.parts')} value={partCount} locale={i18n.resolvedLanguage} />
+        <ImportMetric label={t('import.withoutDate')} value={undatedRows.length} locale={i18n.resolvedLanguage} />
+      </div>
+
+      {undatedRows.length > 0 && (
+        <div className="import-undated">
+          <h3>{t('import.undatedTitle')}</h3>
+          <p>{t('import.undatedHint')}</p>
+          <ul className="import-undated-list">
+            {undatedRows.map((row) => (
+              <UndatedEntryForm key={`${row.sheetName}-${row.rowNumber}`} row={row} onAddDate={onAddDate} />
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div className="import-footer">
+        <p className="import-note">
+          {leftOutCount > 0 && t('import.leftOut', { count: formatCount(leftOutCount) })}
+        </p>
+        <button
+          className="button button-primary"
+          type="button"
+          disabled={committing || (plan.machines.length === 0 && plan.records.length === 0)}
+          onClick={() => void handleCommit()}
+        >
+          <Check size={16} /> {committing ? t('import.committing') : t('import.commitButton')}
+        </button>
+      </div>
+      {commitError && <p className="import-error" role="alert">{t('import.commitFailed')}</p>}
+    </div>
+  );
+}
+
+function UndatedEntryForm({
+  row,
+  onAddDate
+}: {
+  row: SkippedRow;
+  onAddDate: (issueId: string, date: string) => Promise<void>;
 }) {
   const { t } = useTranslation();
-  const [interpretedValue, setInterpretedValue] = useState(decision?.interpretedValue ?? '');
+  const [date, setDate] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(false);
-  const sourceRow = issue.rowNumber === undefined
-    ? undefined
-    : preview.maintenanceRows.find(
-        (row) => row.sheetName === issue.sheetName && row.rowNumber === issue.rowNumber
-      );
-  const sheet = preview.sheets.find((candidate) => candidate.name === issue.sheetName);
-  const rowNumber = issue.rowNumber ?? Number(issue.cellAddress?.match(/\d+$/)?.[0]);
-  const sourceCells = sourceRow?.cells ?? (sheet?.cells.filter(
-    (cell) => Number(cell.address.match(/\d+$/)?.[0]) === rowNumber
-  ).map((source) => ({
-    header: source.address,
-    source
-  })) ?? []);
-  const needsDate = issue.code === 'history-date-needs-review' ||
-    issue.code === 'history-date-missing';
-  const isFormulaError = issue.code === 'formula-error';
-  const isDuplicate = issue.code === 'duplicate-maintenance-record';
 
-  async function saveDecision(
-    action: WorkbookIssueDecisionAction,
-    value?: string
-  ): Promise<void> {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (!row.issueId || !date) return;
+
     setSaving(true);
     setSaveError(false);
     try {
-      await onDecision(issue, action, value);
+      await onAddDate(row.issueId, date);
     } catch (error) {
-      console.error('Workbook review decision could not be saved.', error);
+      console.error('The workbook entry date could not be saved.', error);
       setSaveError(true);
     } finally {
       setSaving(false);
@@ -978,119 +1114,25 @@ function WorkbookIssueReview({
   }
 
   return (
-    <article className={`import-issue-card ${decision ? 'import-issue-reviewed' : ''}`}>
-      <div className="import-issue-title">
-        <strong>{t(`import.issue.${issue.code}`, {
-          sheet: issue.sheetName,
-          row: issue.rowNumber,
-          cell: issue.cellAddress,
-          details: issue.details
-        })}</strong>
-        <span>{decision ? t('import.reviewed') : t('import.needsReview')}</span>
-      </div>
-      {sourceCells.length > 0 && (
-        <details className="import-source-details">
-          <summary>{t('import.inspectSource')}</summary>
-          <dl>
-            {sourceCells.map(({ header, source }) => (
-              <div key={source.address}>
-                <dt>{header} · {source.address}</dt>
-                <dd>{source.displayText || t('import.emptySourceCell')}</dd>
-                {source.formula && <dd>{t('import.formulaLabel')}: {source.formula}</dd>}
-                {source.resultJson && <dd>{t('import.formulaResult')}: {source.resultJson}</dd>}
-                {source.numberFormat && <dd>{t('import.numberFormat')}: {source.numberFormat}</dd>}
-              </div>
-            ))}
-          </dl>
-        </details>
-      )}
-      {!decision && needsDate && (
-        <div className="import-review-action">
-          <label>
-            {t(issue.code === 'history-date-missing' ? 'import.enterMissingDate' : 'import.interpretDate')}
-            <input
-              type="date"
-              value={interpretedValue}
-              onChange={(event) => setInterpretedValue(event.target.value)}
-            />
-          </label>
-          <button
-            className="button button-secondary"
-            type="button"
-            disabled={saving || !interpretedValue}
-            onClick={() => void saveDecision('interpreted-date', interpretedValue)}
-          >
-            {t('import.saveInterpretation')}
-          </button>
-          {issue.code === 'history-date-missing' && (
-            <button
-              className="text-button"
-              type="button"
-              disabled={saving}
-              onClick={() => void saveDecision('acknowledged-missing-date')}
-            >
-              {t('import.leaveDateMissing')}
-            </button>
-          )}
+    <li>
+      <form className="import-undated-row" onSubmit={(event) => void handleSubmit(event)}>
+        <div className="import-undated-copy">
+          <strong>{row.description}</strong>
+          <span>{[row.sheetName, row.details].filter(Boolean).join(' · ')}</span>
         </div>
-      )}
-      {!decision && isFormulaError && (
-        <div className="import-review-action">
-          <label>
-            {t('import.enterFormulaInterpretation')}
-            <input
-              type="text"
-              value={interpretedValue}
-              onChange={(event) => setInterpretedValue(event.target.value)}
-            />
-          </label>
-          <button
-            className="button button-secondary"
-            type="button"
-            disabled={saving || !interpretedValue.trim()}
-            onClick={() => void saveDecision('interpreted-formula', interpretedValue.trim())}
-          >
-            {t('import.saveInterpretation')}
-          </button>
-          <button
-            className="text-button"
-            type="button"
-            disabled={saving}
-            onClick={() => void saveDecision('acknowledged-source-error')}
-          >
-            {t('import.keepFormulaError')}
-          </button>
-        </div>
-      )}
-      {!decision && isDuplicate && (
-        <div className="import-review-action">
-          <button
-            className="button button-secondary"
-            type="button"
-            disabled={saving}
-            onClick={() => void saveDecision('distinct-records')}
-          >
-            {t('import.confirmDistinct')}
-          </button>
-          <button
-            className="text-button"
-            type="button"
-            disabled={saving}
-            onClick={() => void saveDecision('confirmed-duplicate')}
-          >
-            {t('import.confirmDuplicate')}
-          </button>
-        </div>
-      )}
-      {decision && (
-        <p className="import-decision-summary">
-          {t(`import.decision.${decision.action}`, {
-            value: decision.interpretedValue
-          })}
-        </p>
-      )}
-      {saveError && <p className="import-review-error" role="alert">{t('import.saveDecisionFailed')}</p>}
-    </article>
+        <input
+          type="date"
+          value={date}
+          required
+          aria-label={t('import.dateFor', { description: row.description })}
+          onChange={(event) => setDate(event.target.value)}
+        />
+        <button className="button button-secondary" type="submit" disabled={saving || !date}>
+          {t('import.addDate')}
+        </button>
+        {saveError && <p className="import-error" role="alert">{t('import.dateSaveFailed')}</p>}
+      </form>
+    </li>
   );
 }
 
@@ -1121,6 +1163,28 @@ function MachineProfile({
     [machine.id],
     []
   );
+  const newestFirst = [...maintenanceRecords].reverse();
+  const service = nextService(
+    machine,
+    newestFirst.find((record) => record.meterReading !== undefined)?.meterReading
+  );
+  const details = [
+    [t('profile.manufacturer'), machine.manufacturer],
+    [t('profile.model'), machine.model],
+    [t('profile.year'), machine.yearManufactured?.toString()],
+    [t('profile.category'), machine.category],
+    [t('profile.registration'), machine.registrationNumber],
+    [t('profile.serial'), machine.serialNumber],
+    [t('profile.location'), machine.location],
+    [t('profile.fuel'), machine.fuelType],
+    [t('profile.tankCapacity'), machine.tankCapacity],
+    [
+      t('profile.currentMeter'),
+      machine.meterValue === undefined
+        ? undefined
+        : formatMeter(machine.meterValue, machine.meterUnit, i18n.resolvedLanguage, t)
+    ]
+  ].filter((detail): detail is [string, string] => Boolean(detail[1]));
 
   return (
     <>
@@ -1134,9 +1198,7 @@ function MachineProfile({
         <div className="profile-title">
           <div className="eyebrow">{t('profile.eyebrow')}</div>
           <h1>{machine.displayName}</h1>
-          <p>
-            {[machine.manufacturer, machine.model].filter(Boolean).join(' · ') || t('profile.manufacturerModelMissing')}
-          </p>
+          <p>{machineSubtitle(machine)}</p>
         </div>
         <div className="profile-actions">
           <StatusBadge status={machine.status} />
@@ -1160,26 +1222,24 @@ function MachineProfile({
             </div>
           </div>
           <div className="details-grid">
-            <Detail label={t('profile.manufacturer')} value={machine.manufacturer} missing={t('profile.notRecorded')} />
-            <Detail label={t('profile.model')} value={machine.model} missing={t('profile.notRecorded')} />
-            <Detail label={t('profile.year')} value={machine.yearManufactured?.toString()} missing={t('profile.notRecorded')} />
-            <Detail label={t('profile.category')} value={machine.category} missing={t('profile.notRecorded')} />
-            <Detail label={t('profile.registration')} value={machine.registrationNumber} missing={t('profile.notRecorded')} />
-            <Detail label={t('profile.serial')} value={machine.serialNumber} missing={t('profile.notRecorded')} />
-            <Detail label={t('profile.location')} value={machine.location} missing={t('profile.notRecorded')} />
-            <Detail label={t('profile.fuel')} value={machine.fuelType} missing={t('profile.notRecorded')} />
-            <Detail label={t('profile.tankCapacity')} value={machine.tankCapacity} missing={t('profile.notRecorded')} />
-            <Detail
-              label={t('profile.currentMeter')}
-              value={
-                machine.meterValue !== undefined
-                  ? `${new Intl.NumberFormat(i18n.resolvedLanguage).format(machine.meterValue)} ${meterUnitLabel(machine.meterUnit, t)}`
-                  : undefined
-              }
-              missing={t('profile.notRecorded')}
-            />
+            {details.map(([label, value]) => (
+              <Detail key={label} label={label} value={value} />
+            ))}
           </div>
-          {machine.notes && <div className="notes-block"><span>{t('profile.notes')}</span><p>{machine.notes}</p></div>}
+          {machine.parts && machine.parts.length > 0 && (
+            <div className="parts-block">
+              <h3>{t('profile.parts')}</h3>
+              <dl className="parts-list">
+                {machine.parts.map((part) => (
+                  <div key={`${part.sourceCell ?? part.component}:${part.specification}`}>
+                    <dt>{partLabel(part.component, t)}</dt>
+                    <dd>{part.specification}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
+          {machine.notes &&<div className="notes-block"><span>{t('profile.notes')}</span><p>{machine.notes}</p></div>}
         </div>
 
         <div className="panel profile-timeline">
@@ -1211,34 +1271,36 @@ function MachineProfile({
             />
           ) : (
             <ol className="maintenance-timeline">
-              {[...maintenanceRecords].reverse().map((record) => (
+              {newestFirst.map((record) => (
                 <li key={record.id}>
                   <div className="maintenance-timeline-dot" />
                   <div className="maintenance-record-content">
                     <div className="maintenance-record-heading">
                       <strong>{record.workPerformed}</strong>
                       <time dateTime={record.performedAt}>
-                        {new Intl.DateTimeFormat(i18n.resolvedLanguage, { dateStyle: 'medium' })
-                          .format(new Date(`${record.performedAt}T00:00:00`))}
+                        {formatRecordDate(record.performedAt, i18n.resolvedLanguage)}
                       </time>
                     </div>
-                    <span>{t(`maintenance.category.${record.category}`, { defaultValue: record.category })}</span>
-                    {record.meterReading !== undefined && (
-                      <span>
-                        {new Intl.NumberFormat(i18n.resolvedLanguage).format(record.meterReading)} {meterUnitLabel(machine.meterUnit, t)}
-                      </span>
+                    {(record.category !== 'other' || record.meterReading !== undefined) && (
+                      <div className="maintenance-record-tags">
+                        {record.category !== 'other' && (
+                          <span>{t(`maintenance.category.${record.category}`, { defaultValue: record.category })}</span>
+                        )}
+                        {record.meterReading !== undefined && (
+                          <span>
+                            <Gauge size={12} />
+                            {formatMeter(record.meterReading, machine.meterUnit, i18n.resolvedLanguage, t)}
+                          </span>
+                        )}
+                      </div>
                     )}
                     {record.partsUsed && <p>{t('maintenance.partsUsed')}: {record.partsUsed}</p>}
                     {record.notes && <p>{record.notes}</p>}
-                    <small>{t('maintenance.savedOnDevice')}</small>
                   </div>
                 </li>
               ))}
             </ol>
           )}
-          <div className="panel-footnote">
-            <ShieldCheck size={15} /> {t('profile.historyPreserved')}
-          </div>
         </div>
 
         <div className="panel profile-schedule">
@@ -1248,13 +1310,29 @@ function MachineProfile({
               <p>{t('profile.upcoming')}</p>
             </div>
           </div>
-          <div className="schedule-empty">
-            <Clock3 size={19} />
-            <div>
-              <strong>{t('profile.noConfirmedSchedule')}</strong>
-              <span>{t('profile.scheduleReview')}</span>
+          {service ? (
+            <div className="schedule-target">
+              <div className="schedule-target-icon">
+                <Gauge size={19} />
+              </div>
+              <div>
+                <strong>
+                  {t('dashboard.serviceAt', {
+                    value: formatMeter(service.target, service.unit, i18n.resolvedLanguage, t)
+                  })}
+                </strong>
+                <ServiceRemaining service={service} />
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="schedule-empty">
+              <Clock3 size={19} />
+              <div>
+                <strong>{t('profile.noServiceTarget')}</strong>
+                <span>{t('profile.noServiceTargetHint')}</span>
+              </div>
+            </div>
+          )}
         </div>
       </section>
     </>
@@ -1495,6 +1573,7 @@ function MachineForm({
         meterRecordedAt: parsedMeter === undefined ? machine?.meterRecordedAt : new Date().toISOString(),
         notes: optionalValue(notes),
         status,
+        parts: machine?.parts,
         sourceAttributes: machine?.sourceAttributes ?? {}
       });
     } catch (error) {
@@ -1626,11 +1705,11 @@ function Field({
   );
 }
 
-function Detail({ label, value, missing }: { label: string; value?: string; missing: string }) {
+function Detail({ label, value }: { label: string; value: string }) {
   return (
     <div className="detail-item">
       <span>{label}</span>
-      <strong>{value || missing}</strong>
+      <strong>{value}</strong>
     </div>
   );
 }
@@ -1675,6 +1754,50 @@ function meterUnitLabel(
     case 'unknown':
       return '';
   }
+}
+
+function formatMeter(
+  value: number,
+  unit: MeterUnit,
+  locale: string | undefined,
+  t: ReturnType<typeof useTranslation>['t']
+): string {
+  return `${new Intl.NumberFormat(locale).format(value)} ${meterUnitLabel(unit, t)}`.trim();
+}
+
+function formatRecordDate(performedAt: string, locale: string | undefined): string {
+  return new Intl.DateTimeFormat(locale, { dateStyle: 'medium' })
+    .format(new Date(`${performedAt}T00:00:00`));
+}
+
+const partLabelKeys: Record<string, string> = {
+  oilfilterchange: 'parts.oilFilter',
+  airfilterchange: 'parts.airFilter',
+  fuelfilterchange: 'parts.fuelFilter',
+  batteryreplacement: 'parts.battery',
+  tires: 'parts.tires',
+  tirerepairreplacement: 'parts.tires',
+  hydraulic: 'parts.hydraulics',
+  cranehydraulic: 'parts.hydraulics',
+  compressorfilter: 'parts.compressorFilter',
+  oilseperatorcartridge: 'parts.oilSeparator',
+  oilseparatorcartridge: 'parts.oilSeparator',
+  enginecoolant: 'parts.coolant'
+};
+
+function partLabel(component: string, t: ReturnType<typeof useTranslation>['t']): string {
+  const key = partLabelKeys[component.toLocaleLowerCase().replace(/[^a-z0-9]/g, '')];
+  return key ? t(key) : component;
+}
+
+function machineSubtitle(machine: Machine): string {
+  return [machine.manufacturer, machine.model].filter(Boolean).join(' · ') || machine.category || '';
+}
+
+function greetingKey(): 'greeting.morning' | 'greeting.afternoon' | 'greeting.evening' {
+  const hour = new Date().getHours();
+  if (hour < 12) return 'greeting.morning';
+  return hour < 18 ? 'greeting.afternoon' : 'greeting.evening';
 }
 
 function optionalValue(value: string): string | undefined {

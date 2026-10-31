@@ -20,11 +20,21 @@ npm run build
 
 The foundation includes a responsive application shell, PWA manifest/service worker, local machine profiles and search, offline maintenance-record creation, an IndexedDB database, and a local outbox. Machine and maintenance writes are committed with their pending outbox operation in one IndexedDB transaction. English and Georgian interface localization is available from **Settings**; the selected language is stored separately from machine data on each device. Georgian-capable Noto Sans Georgian font files are bundled for offline use. Cross-device language preferences will be connected to employee profiles when authentication is implemented. Machine names, descriptions, and maintenance text are preserved verbatim.
 
-Changes are explicitly described as saved on this device; synchronization is not implemented yet. Historical maintenance records are not imported, and maintenance schedules are not configured. Employees can add new maintenance records to a local machine profile while offline.
+Changes are explicitly described as saved on this device; synchronization is not implemented yet. Maintenance schedules are not configured. Employees can add new maintenance records to a local machine profile while offline.
 
-The Fleet page includes a read-only `.xlsx` dry run. It preserves populated-cell values, formulas/results, cell styles, comments, threaded-comment XML, worksheet layout, and worksheet/row/cell provenance in the review model; it reports candidate machines, history rows, schedule suggestions, and unresolved issues. Each flagged item can be inspected and annotated with an explicit human decision. Date interpretations and formula values are stored separately from the source; acknowledgements do not fill missing values, repair formulas, or remove duplicate rows. Review decisions are keyed to the source file's SHA-256 hash. No workbook contents are copied into the local database, and no records are imported. Workbook commits remain disabled. Files are limited to 20 MB and 500,000 populated cells.
+**Import from Excel** on the Fleet page reads an `.xlsx` workbook without changing it. The read-only analysis preserves populated-cell values, formulas/results, cell styles, comments, threaded-comment XML, worksheet layout, and worksheet/row/cell provenance; the import panel shows only what will be saved (machines, service records, and entries without a date). Dates entered for undated entries are stored separately from the source and keyed to the workbook's SHA-256 hash. Files are limited to 20 MB and 500,000 populated cells.
 
-The Excel source in `source-data/Maintenence.xlsx` is not modified. Import must start with a dry run and preserve source provenance; imported schedule recommendations require human confirmation.
+**Import data** saves machine profiles and history rows in one IndexedDB transaction, each with a pending outbox operation and its workbook sheet/row provenance in `sourceAttributes`:
+
+- Each equipment sheet becomes a machine named after the sheet; its category comes from the **Home** index sheet. The current meter is the **Ending Mileage** value, and the meter unit is set only when the sheet's own readings consistently say `h` or `km`.
+- Rows identical to the **TEMPLATE** sheet's example rows are not imported, and template example values left in real rows (for example, costs of 25/10) are ignored.
+- Dates are read day-first, as written throughout the workbook. Text such as `29/10/2025` or `12.11.2025` is parsed day-first, and stored Excel dates whose day and month are both 12 or less are swapped back, because a month-first Excel locale converted entries such as `10/07/2025` into 7 October. The original cell value is kept with each record.
+- Rows without a usable date are not imported and no date is invented. The import panel lists them so a known date can be added before importing.
+- Excel threaded comments on a machine sheet's component rows (part numbers for oil, air, fuel and hydraulic filters, batteries, tires) become that machine's **Parts & specifications** list, labelled by the commented row. Empty comments and replies are not imported. Re-importing adds part details to machines that were imported before they existed, without changing anything else. Part numbers are searchable on the Fleet page.
+- The dashboard's **Upcoming service** list and each machine's schedule card show the workbook's "Next service" target and how far the current meter (or the latest history reading) is from it.
+- Importing again is safe: rows already imported and machines that already exist on the device (matched by sheet, registration, or serial number) are left unchanged.
+
+The Excel source in `source-data/Maintenence.xlsx` is not modified. Import must start with a dry run and preserve source provenance; schedule recommendations from the workbook are not imported and require human confirmation.
 
 ## Platform notes
 
