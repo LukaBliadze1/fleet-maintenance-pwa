@@ -60,6 +60,15 @@ export interface MachineCandidate {
   historyRowCount: number;
 }
 
+export interface WorkbookComment {
+  sheetName: string;
+  cellAddress: string;
+  text: string;
+  author?: string;
+  createdAt?: string;
+  isReply: boolean;
+}
+
 export interface ScheduleCandidate {
   sheetName: string;
   rowNumber: number;
@@ -72,12 +81,14 @@ export interface WorkbookDryRun {
   sheets: ImportedSourceSheet[];
   machines: MachineCandidate[];
   maintenanceRows: MaintenanceRowCandidate[];
+  templateRows: MaintenanceRowCandidate[];
   schedules: ScheduleCandidate[];
   issues: WorkbookIssue[];
   formulaErrorCount: number;
   commentCount: number;
   threadedCommentCount: number;
   threadedCommentParts: Array<{ path: string; xml: string; count: number }>;
+  comments: WorkbookComment[];
   sourceCellCount: number;
 }
 
@@ -107,7 +118,11 @@ const profileLabels = [
   'Location',
   'Acquisition Date',
   'Exp. Date',
-  'Next Service Due'
+  'Next Service Due',
+  'Next Service',
+  'Hours',
+  'Mileage',
+  'Ending Mileage'
 ];
 
 function normalizeLabel(value: string): string {
@@ -195,6 +210,88 @@ function snapshotCell(cell: ExcelJS.Cell): ImportedCellSnapshot {
   };
 }
 
+function decodeXml(value: string): string {
+  return value
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, decimal: string) => String.fromCodePoint(Number(decimal)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+function xmlAttribute(tag: string, name: string): string | undefined {
+  const value = tag.match(new RegExp(`\\s${name}="([^"]*)"`))?.[1];
+  return value === undefined ? undefined : decodeXml(value);
+}
+
+function xmlTags(xml: string, name: string): string[] {
+  return [...xml.matchAll(new RegExp(`<${name}\\s[^>]*>`, 'g'))].map((match) => match[0]);
+}
+
+function resolvePartPath(baseDirectory: string, target: string): string {
+  if (target.startsWith('/')) return target.slice(1);
+  const parts = `${baseDirectory}${target}`.split('/');
+  const resolved: string[] = [];
+  for (const part of parts) {
+    if (part === '..') resolved.pop();
+    else if (part !== '.') resolved.push(part);
+  }
+  return resolved.join('/');
+}
+
+/** Reads Excel threaded comments and maps each one to its worksheet and cell. */
+async function readThreadedComments(zip: JSZip): Promise<WorkbookComment[]> {
+  const read = async (path: string) => zip.file(path)?.async('string') ?? '';
+  const workbookXml = await read('xl/workbook.xml');
+  const workbookRelationships = xmlTags(await read('xl/_rels/workbook.xml.rels'), 'Relationship');
+  const people = new Map<string, string>();
+  for (const path of Object.keys(zip.files).filter((file) => /^xl\/persons\/[^/]+\.xml$/i.test(file))) {
+    for (const person of xmlTags(await read(path), 'person')) {
+      const id = xmlAttribute(person, 'id');
+      const displayName = xmlAttribute(person, 'displayName');
+      if (id && displayName) people.set(id, displayName);
+    }
+  }
+
+  const comments: WorkbookComment[] = [];
+  for (const sheet of xmlTags(workbookXml, 'sheet')) {
+    const sheetName = xmlAttribute(sheet, 'name');
+    const relationshipId = xmlAttribute(sheet, 'r:id');
+    const sheetRelationship = workbookRelationships
+      .find((relationship) => xmlAttribute(relationship, 'Id') === relationshipId);
+    const sheetTarget = sheetRelationship ? xmlAttribute(sheetRelationship, 'Target') : undefined;
+    if (!sheetName || !sheetTarget) continue;
+
+    const sheetPath = resolvePartPath('xl/', sheetTarget);
+    const sheetDirectory = sheetPath.slice(0, sheetPath.lastIndexOf('/') + 1);
+    const sheetFile = sheetPath.slice(sheetDirectory.length);
+    const threadTargets = xmlTags(await read(`${sheetDirectory}_rels/${sheetFile}.rels`), 'Relationship')
+      .filter((relationship) => /\/threadedComment$/.test(xmlAttribute(relationship, 'Type') ?? ''))
+      .map((relationship) => xmlAttribute(relationship, 'Target'))
+      .filter((target): target is string => Boolean(target));
+
+    for (const target of threadTargets) {
+      const xml = await read(resolvePartPath(sheetDirectory, target));
+      for (const match of xml.matchAll(/<threadedComment(\s[^>]*)>([\s\S]*?)<\/threadedComment>/g)) {
+        const cellAddress = xmlAttribute(match[1], 'ref');
+        if (!cellAddress) continue;
+        const personId = xmlAttribute(match[1], 'personId');
+        comments.push({
+          sheetName,
+          cellAddress,
+          text: decodeXml(match[2].match(/<text>([\s\S]*?)<\/text>/)?.[1] ?? '').replace(/\r\n?/g, '\n').trim(),
+          author: personId ? people.get(personId) : undefined,
+          createdAt: xmlAttribute(match[1], 'dT'),
+          isReply: Boolean(xmlAttribute(match[1], 'parentId'))
+        });
+      }
+    }
+  }
+  return comments;
+}
+
 function hasLiteralValue(cell: ExcelJS.Cell): boolean {
   if (isMergedChild(cell)) return false;
   const value = sourceValue(cell);
@@ -204,10 +301,11 @@ function hasLiteralValue(cell: ExcelJS.Cell): boolean {
   return true;
 }
 
-function isNonPlaceholder(value: string | undefined): value is string {
+export function isNonPlaceholder(value: string | undefined): value is string {
   if (!value) return false;
   const normalized = value.trim().toLocaleLowerCase();
-  return normalized !== '' && !['#', 'x', 'n/a', 'na', 'unknown', '-'].includes(normalized);
+  return normalized !== '' &&
+    !['#', 'x', 'n/a', 'na', 'unknown', '-', '...', '…'].includes(normalized);
 }
 
 function findHistoryHeader(worksheet: ExcelJS.Worksheet): ExcelJS.Row | undefined {
@@ -448,6 +546,7 @@ export async function analyzeWorkbook(
   const sheets: ImportedSourceSheet[] = [];
   const machines: MachineCandidate[] = [];
   const maintenanceRows: MaintenanceRowCandidate[] = [];
+  const templateRows: MaintenanceRowCandidate[] = [];
   const schedules: ScheduleCandidate[] = [];
   const identifiers = new Map<string, string>();
   let formulaErrorCount = 0;
@@ -463,6 +562,7 @@ export async function analyzeWorkbook(
     threadedCommentCount += count;
     threadedCommentParts.push({ path, xml, count });
   }
+  const comments = await readThreadedComments(zip);
 
   for (const worksheet of workbook.worksheets) {
     const isTemplate = normalizeLabel(worksheet.name) === 'template';
@@ -538,6 +638,13 @@ export async function analyzeWorkbook(
 
     if (kind === 'other') {
       issues.push({ code: 'unrecognized-sheet', sheetName: worksheet.name });
+      continue;
+    }
+    if (kind === 'template') {
+      const templateHeaderRow = findHistoryHeader(worksheet);
+      if (templateHeaderRow) {
+        templateRows.push(...extractMaintenanceRows(worksheet, templateHeaderRow, []));
+      }
       continue;
     }
     if (kind !== 'equipment' || !historyHeaderRow) continue;
@@ -622,12 +729,14 @@ export async function analyzeWorkbook(
     sheets,
     machines,
     maintenanceRows,
+    templateRows,
     schedules,
     issues: identifiedIssues,
     formulaErrorCount,
     commentCount,
     threadedCommentCount,
     threadedCommentParts,
+    comments,
     sourceCellCount
   };
 }

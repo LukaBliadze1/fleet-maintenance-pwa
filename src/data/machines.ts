@@ -94,7 +94,8 @@ export async function searchMachines(query: string): Promise<Machine[]> {
       machine.registrationNumber,
       machine.category,
       machine.location,
-      machine.status
+      machine.status,
+      ...(machine.parts?.map((part) => part.specification) ?? [])
     ];
 
     return searchableFields.some((value) =>
